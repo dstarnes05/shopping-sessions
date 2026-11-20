@@ -1,0 +1,9 @@
+/target/
+/dev/
+/out/
+/dev-answer/
+/generator/
+*.zip
+.DS_Store
+__pycache__/
+/.venv/
