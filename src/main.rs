@@ -7,13 +7,12 @@ use std::{
     error::Error,
     fs,
     hash::{BuildHasher, RandomState},
-    io::{BufRead, BufReader},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Mutex,
     time::Instant,
 };
 
-use input::{decimal, fields, files, rows, timestamp, DAY, WEEK};
+use input::{decimal, fields, files, rows, scan, scan_chunks, timestamp, DAY, WEEK};
 use rayon::prelude::*;
 
 type Bytes = Box<[u8]>;
@@ -132,33 +131,18 @@ impl<T> Shards<T> {
         }
     }
 
+    fn index(&self, id: &[u8]) -> usize {
+        self.hash.hash_one(id) as usize % SHARDS
+    }
+
     fn update(&self, id: &[u8], update: impl FnOnce(&mut HashMap<Bytes, T>)) {
-        let shard = self.hash.hash_one(id) as usize % SHARDS;
+        let shard = self.index(id);
         update(&mut self.maps[shard].lock().unwrap());
     }
 
     fn into_maps(self) -> impl Iterator<Item = HashMap<Bytes, T>> {
         self.maps.into_iter().map(|map| map.into_inner().unwrap())
     }
-}
-
-fn scan<const N: usize>(paths: &[PathBuf], visit: impl Fn([&[u8]; N]) + Sync) -> Result<()> {
-    paths.par_iter().try_for_each(|path| {
-        let mut reader = BufReader::with_capacity(256 * 1024, fs::File::open(path)?);
-        let mut line = Vec::new();
-        reader.read_until(b'\n', &mut line)?;
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            let bytes = line.strip_suffix(b"\n").unwrap_or(&line);
-            if let Some(values) = fields(bytes) {
-                visit(values);
-            }
-        }
-        Ok(())
-    })
 }
 
 fn canonical<'a>(aliases: &'a HashMap<Bytes, Bytes>, id: &'a [u8]) -> &'a [u8] {
@@ -330,34 +314,50 @@ fn main() -> Result<()> {
         .collect();
 
     let candidates = Shards::<Candidate>::new();
-    scan(&files(&data.join("events"))?, |values: [&[u8]; 7]| {
-        let id = values[0];
-        if id.is_empty() {
-            return;
-        }
-        let Some(ingest) = timestamp(values[3]) else {
-            return;
-        };
-        // Invalid candidates remain in the map to suppress later valid copies.
-        let candidate = Candidate {
-            ingest,
-            valid: validate_event(values, ingest, window, &aliases, &products, unknown),
-        };
-        candidates.update(id, |map| {
-            if let Some(current) = map.get_mut(id) {
-                if ingest < current.ingest {
-                    *current = candidate;
-                }
-            } else {
-                map.insert(id.into(), candidate);
+    let ingest_started = Instant::now();
+    scan_chunks(&files(&data.join("events"))?, |chunk| {
+        let mut batches: [_; SHARDS] = std::array::from_fn(|_| Vec::new());
+        for line in chunk.split(|&byte| byte == b'\n') {
+            let Some(values) = fields::<7>(line) else {
+                continue;
+            };
+            let id = values[0];
+            if id.is_empty() {
+                continue;
             }
-        });
+            let Some(ingest) = timestamp(values[3]) else {
+                continue;
+            };
+            // Invalid candidates remain eligible to suppress later valid copies.
+            let candidate = Candidate {
+                ingest,
+                valid: validate_event(values, ingest, window, &aliases, &products, unknown),
+            };
+            let shard = candidates.index(id);
+            batches[shard].push((id, candidate));
+        }
+        for (shard, batch) in batches.into_iter().enumerate() {
+            if batch.is_empty() {
+                continue;
+            }
+            let mut map = candidates.maps[shard].lock().unwrap();
+            for (id, candidate) in batch {
+                if let Some(current) = map.get_mut(id) {
+                    if candidate.ingest < current.ingest {
+                        *current = candidate;
+                    }
+                } else {
+                    map.insert(id.into(), candidate);
+                }
+            }
+        }
     })?;
     eprintln!(
-        "Events parsed and deduplicated in {:.2?}",
-        started.elapsed()
+        "Event ingestion and deduplication: {:.2?}",
+        ingest_started.elapsed()
     );
 
+    let grouping_started = Instant::now();
     let events = Shards::<Vec<Event>>::new();
     candidates
         .into_maps()
@@ -375,6 +375,8 @@ fn main() -> Result<()> {
             }
         });
 
+    eprintln!("Event grouping: {:.2?}", grouping_started.elapsed());
+    let click_started = Instant::now();
     let clicks = Shards::<Vec<Click>> {
         hash: events.hash.clone(),
         ..Shards::new()
@@ -410,7 +412,11 @@ fn main() -> Result<()> {
             });
         },
     )?;
-    eprintln!("Person groups built in {:.2?}", started.elapsed());
+    eprintln!(
+        "Click ingestion and grouping: {:.2?}",
+        click_started.elapsed()
+    );
+    let output_started = Instant::now();
 
     fs::create_dir_all(destination.join("user_daily"))?;
     let pairs: Vec<_> = events.into_maps().zip(clicks.into_maps()).collect();
@@ -450,7 +456,11 @@ fn main() -> Result<()> {
             combined.assists += values.assists;
         }
     }
-    output::write_campaigns(Path::new(&destination), &campaigns, daily)?;
+    output::write_campaigns(&destination, &campaigns, daily)?;
+    eprintln!(
+        "Sessions, attribution and Parquet output: {:.2?}",
+        output_started.elapsed()
+    );
     eprintln!("Completed in {:.2?}", started.elapsed());
     Ok(())
 }

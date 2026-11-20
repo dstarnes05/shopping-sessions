@@ -26,8 +26,8 @@ Use an empty output directory for each run. The Docker image runs as UID 1000 wi
 ## Pipeline
 
 - Resolve linked identities with union-find and preserve the byte-wise minimum ID.
-- Stream CSV files in parallel. Shard event deduplication by raw event ID, retaining invalid earliest copies so later copies cannot rescue them.
+- Scan events and clicks in parallel using newline-aligned byte ranges. Batch event deduplication updates by raw event-ID shard, retaining invalid earliest copies so later copies cannot rescue them.
 - Group surviving events and valid clicks by canonical person, sort each person's records, and sweep the inclusive seven-day click window as sessions close.
 - Aggregate campaign-day results per shard and merge them. Write user-day results in bounded Parquet row groups.
 
-The first implementation keeps deduplication and person groups in memory and schedules parsing by file. Benchmark peak RSS and wall time on a native x86-64 60M run before choosing what to optimize.
+Deduplication and person groups stay in memory. The binary reports separate timings for event ingestion, event grouping, click ingestion, and session aggregation with Parquet output.
