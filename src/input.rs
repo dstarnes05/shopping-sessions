@@ -1,5 +1,6 @@
 use std::{
-    fs, io,
+    fs,
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -118,4 +119,88 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
         + day_of_year
         - 719_468;
     Some(days * DAY + ((hour * 60 + minute - offset) * 60 + second) * 1000)
+}
+
+const SCAN_CHUNK: u64 = 2 * 1024 * 1024;
+
+pub fn scan_chunks(paths: &[PathBuf], visit: impl Fn(&[u8]) + Sync) -> crate::Result<()> {
+    use rayon::prelude::*;
+
+    let mut chunks = Vec::new();
+    for path in paths {
+        let len = fs::metadata(path)?.len();
+        for start in (0..len).step_by(SCAN_CHUNK as usize) {
+            chunks.push((path, start, (start + SCAN_CHUNK).min(len)));
+        }
+    }
+    chunks
+        .into_par_iter()
+        .try_for_each_init(Vec::new, |buffer, (path, start, end)| {
+            let reader = BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
+            read_chunk(reader, start, end, buffer)?;
+            visit(buffer);
+            Ok(())
+        })
+}
+
+fn read_chunk(
+    mut reader: impl BufRead + Seek,
+    start: u64,
+    end: u64,
+    buffer: &mut Vec<u8>,
+) -> io::Result<()> {
+    buffer.clear();
+    let first = if start == 0 {
+        // The first byte range owns the header, which is never a data row.
+        reader.read_until(b'\n', buffer)? as u64
+    } else {
+        reader.seek(SeekFrom::Start(start - 1))?;
+        // At a line boundary this consumes just the preceding newline.
+        // Otherwise the range where the line began owns it.
+        start - 1 + reader.read_until(b'\n', buffer)? as u64
+    };
+    buffer.clear();
+    if first < end {
+        reader.by_ref().take(end - first).read_to_end(buffer)?;
+        if buffer.last().is_some_and(|&byte| byte != b'\n') {
+            reader.read_until(b'\n', buffer)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn scan<const N: usize>(
+    paths: &[PathBuf],
+    visit: impl Fn([&[u8]; N]) + Sync,
+) -> crate::Result<()> {
+    scan_chunks(paths, |chunk| {
+        for line in chunk.split(|&byte| byte == b'\n') {
+            if let Some(values) = fields(line) {
+                visit(values);
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn ranges_cover_data_exactly_once() {
+        let input =
+            b"first,second\nleft,right\n\nvery long line across several ranges,x\nq,r\nfinal,row";
+        let expected = &input[b"first,second\n".len()..];
+        for chunk_size in 1..=input.len() {
+            let mut collected = Vec::new();
+            let mut buffer = Vec::new();
+            for start in (0..input.len()).step_by(chunk_size) {
+                let end = (start + chunk_size).min(input.len());
+                read_chunk(Cursor::new(input), start as u64, end as u64, &mut buffer).unwrap();
+                collected.extend_from_slice(&buffer);
+            }
+            assert_eq!(collected, expected, "chunk size {chunk_size}");
+        }
+    }
 }
