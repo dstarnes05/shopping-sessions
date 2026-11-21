@@ -121,6 +121,28 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
     Some(days * DAY + ((hour * 60 + minute - offset) * 60 + second) * 1000)
 }
 
+// Parse the common 13-digit epoch form. All other lengths use the full grammar.
+fn epoch13(bytes: &[u8]) -> Option<i64> {
+    let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    const HIGH: u64 = 0xf0f0f0f0f0f0f0f0;
+    const ASCII: u64 = 0x3030303030303030;
+    if word & HIGH != ASCII || (word.wrapping_add(0x0606060606060606) & HIGH) != ASCII {
+        return None;
+    }
+    let digits = word ^ ASCII;
+    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff00ff00ff00ff;
+    let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000ffff0000ffff;
+    let prefix = (quads & 0xffff) * 10000 + (quads >> 32);
+    let mut value = prefix as i64;
+    for &byte in &bytes[8..] {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + i64::from(byte - b'0');
+    }
+    Some(value)
+}
+
 const SCAN_CHUNK: u64 = 2 * 1024 * 1024;
 
 pub fn scan_chunks(paths: &[PathBuf], visit: impl Fn(&[u8]) + Sync) -> crate::Result<()> {
@@ -212,6 +234,9 @@ pub struct Dates {
 
 impl Dates {
     pub fn parse(&mut self, value: &[u8]) -> Option<i64> {
+        if value.len() == 13 {
+            return epoch13(value);
+        }
         if value.len() != 20 || value[19] != b'Z' {
             return timestamp(value);
         }
@@ -237,5 +262,52 @@ impl Dates {
         let second = pair(value[17], value[18])?;
         (hour < 24 && minute < 60 && second < 60)
             .then(|| midnight + ((hour * 60 + minute) * 60 + second) * 1000)
+    }
+}
+
+pub fn visit_rows<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // The runtime check satisfies visit's target-feature precondition.
+        return unsafe { crate::block::visit(chunk, visit) };
+    }
+    data_rows::<N>(chunk).for_each(visit)
+}
+
+#[cfg(test)]
+mod differential {
+    use super::*;
+    #[test]
+    fn block_fields_match_reference() {
+        // Shift the same quoted, malformed, empty and long fields across each SIMD lane.
+        for shift in 0..96 {
+            let mut data = vec![b'x'; shift];
+            data.extend_from_slice(b",b,c,d\n\nae,b,c,d\n\"q\",\"\",c,d\na,\"b\"c,c,d\na,\"x\"\",c,d\na,,,\n,,,\na,\"b,c,d\n1,2,3,4\r\n");
+            data.extend_from_slice(&[b'x'; 101]);
+            data.extend_from_slice(b",two,three,\"four\"");
+            for end in 0..=data.len() {
+                let chunk = &data[..end];
+                let expected: Vec<_> = data_rows::<4>(chunk).collect();
+                let mut index = 0;
+                visit_rows::<4>(chunk, |row| {
+                    assert_eq!(expected[index], row);
+                    index += 1;
+                });
+                assert_eq!(index, expected.len());
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_digits_match_generic_parser() {
+        let mut value = *b"1791071890000";
+        for index in 0..value.len() {
+            let saved = value[index];
+            for byte in 0..=255 {
+                value[index] = byte;
+                assert_eq!(Dates::default().parse(&value), timestamp(&value));
+            }
+            value[index] = saved;
+        }
     }
 }

@@ -1,3 +1,5 @@
+#[cfg(target_arch = "x86_64")]
+mod block;
 mod ids;
 use ahash::AHashMap;
 mod input;
@@ -129,6 +131,8 @@ struct Candidate {
     event: Event,
 }
 
+mod radix;
+
 const SHARDS: usize = 256;
 const PARTITIONS_PER_FILE: usize = 8;
 
@@ -187,19 +191,11 @@ fn validate_event(
 
 fn summarize(
     events: &mut [Event],
-    clicks: &mut Vec<Click>,
+    clicks: &[(u64, Click)],
     organic: usize,
-    click_ids: &ids::Ids,
     campaign_days: &mut HashMap<(usize, i32), CampaignDay>,
 ) -> HashMap<i32, UserDay> {
     events.sort_unstable_by_key(|event| event.time);
-    // Put the smallest ID last at a tied timestamp so the last eligible click wins.
-    clicks.sort_unstable_by(|a, b| {
-        a.time
-            .cmp(&b.time)
-            .then_with(|| click_ids.compare(b.id, a.id))
-    });
-    clicks.dedup_by(|a, b| a.id == b.id);
     let mut user_days = HashMap::<i32, UserDay>::new();
     let mut active = HashMap::<usize, usize>::new();
     let (mut first, mut next) = (0, 0);
@@ -227,12 +223,12 @@ fn summarize(
         daily.events += count as i64;
         daily.revenue += revenue;
 
-        while next < clicks.len() && clicks[next].time <= start {
-            *active.entry(clicks[next].campaign).or_default() += 1;
+        while next < clicks.len() && clicks[next].1.time <= start {
+            *active.entry(clicks[next].1.campaign).or_default() += 1;
             next += 1;
         }
-        while first < next && clicks[first].time < start - WEEK {
-            let Entry::Occupied(mut count) = active.entry(clicks[first].campaign) else {
+        while first < next && clicks[first].1.time < start - WEEK {
+            let Entry::Occupied(mut count) = active.entry(clicks[first].1.campaign) else {
                 unreachable!("each expired click was active");
             };
             *count.get_mut() -= 1;
@@ -242,7 +238,7 @@ fn summarize(
             first += 1;
         }
         let credited = if first < next {
-            clicks[next - 1].campaign
+            clicks[next - 1].1.campaign
         } else {
             organic
         };
@@ -322,12 +318,12 @@ fn main() -> Result<()> {
     scan_chunks(&files(&data.join("events"))?, |chunk| {
         let mut batches = vec![Vec::new(); SHARDS];
         let mut dates = input::Dates::default();
-        for values in input::data_rows::<7>(chunk) {
+        input::visit_rows::<7>(chunk, |values| {
             if values[0].is_empty() {
-                continue;
+                return;
             }
             let Some(ingest) = dates.parse(values[3]) else {
-                continue;
+                return;
             };
             let id = event_ids.encode(values[0]);
             // Invalid winners suppress later copies. No accepted timestamp can
@@ -350,7 +346,7 @@ fn main() -> Result<()> {
                 user,
                 event,
             });
-        }
+        });
         flush(batches, &candidates);
     })?;
     eprintln!("Event scan: {:.2?}", ingest_started.elapsed());
@@ -360,7 +356,7 @@ fn main() -> Result<()> {
     let events = partitions();
     candidates.into_par_iter().for_each(|partition| {
         let mut records = partition.into_inner().unwrap();
-        records.sort_unstable_by_key(|record| record.id);
+        radix::group(&mut records);
         let mut batches = vec![Vec::new(); SHARDS];
         for copies in records.chunk_by(|a, b| a.id == b.id) {
             let winner = copies.iter().min_by_key(|record| record.ingest).unwrap();
@@ -381,18 +377,18 @@ fn main() -> Result<()> {
     scan_chunks(&files(&data.join("clicks"))?, |chunk| {
         let mut batches: Vec<Vec<_>> = (0..SHARDS).map(|_| Vec::new()).collect();
         let mut dates = input::Dates::default();
-        for [id, user, campaign, time] in input::data_rows::<4>(chunk) {
+        input::visit_rows::<4>(chunk, |[id, user, campaign, time]| {
             if id.is_empty() || user.is_empty() {
-                continue;
+                return;
             }
             let Some(&campaign) = campaign_ids.get(campaign) else {
-                continue;
+                return;
             };
             let Some(time) = dates.parse(time) else {
-                continue;
+                return;
             };
             if !(window.0 - WEEK..window.1).contains(&time) {
-                continue;
+                return;
             }
             let user = canonical(users.encode(user));
             batches[shard(user)].push((
@@ -403,7 +399,7 @@ fn main() -> Result<()> {
                     campaign,
                 },
             ));
-        }
+        });
         flush(batches, &clicks);
     })?;
     let output_started = Instant::now();
@@ -433,11 +429,14 @@ fn main() -> Result<()> {
             if let Some(start) = profile_started {
                 writing += start.elapsed();
             }
-            for (mut events, clicks) in partitions {
-                let mut by_user = HashMap::<u64, Vec<Click>>::new();
-                for (user, click) in clicks {
-                    by_user.entry(user).or_default().push(click);
-                }
+            for (mut events, mut clicks) in partitions {
+                clicks.sort_unstable_by(|(u, a), (v, b)| {
+                    u.cmp(v)
+                        .then_with(|| a.time.cmp(&b.time))
+                        .then_with(|| click_ids.compare(b.id, a.id))
+                });
+                clicks.dedup_by(|a, b| a.1.id == b.1.id);
+                let mut click_groups = clicks.chunk_by(|a, b| a.0 == b.0).peekable();
                 events.sort_unstable_by_key(|record| record.0);
                 let mut person_events = Vec::new();
                 for group in events.chunk_by(|a, b| a.0 == b.0) {
@@ -445,14 +444,11 @@ fn main() -> Result<()> {
                     person_events.extend(group.iter().map(|row| row.1));
                     let user_id = group[0].0;
                     let user = users.decode(user_id);
-                    let mut clicks = by_user.remove(&user_id).unwrap_or_default();
-                    let days = summarize(
-                        &mut person_events,
-                        &mut clicks,
-                        organic,
-                        &click_ids,
-                        &mut campaign_days,
-                    );
+                    while click_groups.next_if(|g| g[0].0 < user_id).is_some() {}
+                    let clicks = click_groups
+                        .next_if(|g| g[0].0 == user_id)
+                        .unwrap_or_default();
+                    let days = summarize(&mut person_events, clicks, organic, &mut campaign_days);
                     let write_started = profile.then(Instant::now);
                     for (day, daily) in days {
                         let top = daily
