@@ -28,7 +28,7 @@ for seed in 42 98; do
     done
     for v in parser time radix click; do python scripts/compare.py /tmp/out-base /tmp/out-"$v"; done
 done
-choices=$(python bench/select.py /tmp/results)
+choices=$(python bench/choose_variants.py /tmp/results)
 echo "SELECTED $choices"
 build best $choices
 for seed in 42 98; do
