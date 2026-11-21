@@ -1,4 +1,4 @@
-//! A reversible encoding for common nine-byte IDs, plus an exact dictionary
+//! A reversible encoding for short prefixed IDs, plus an exact dictionary
 //! for all other byte strings. Each column has its own namespace.
 use std::{collections::HashMap, sync::Mutex};
 
@@ -18,8 +18,17 @@ impl Ids {
     }
 
     pub fn encode(&self, bytes: &[u8]) -> u64 {
-        if bytes.len() == 9 && bytes[0] == self.prefix && bytes[1] < 128 {
-            return u64::from_be_bytes(bytes[1..].try_into().unwrap());
+        // Right-padding preserves byte order. A trailing NUL needs the dictionary
+        // so decoding can distinguish the original suffix from its padding.
+        if bytes.first() == Some(&self.prefix)
+            && bytes.len() >= 2
+            && bytes.len() <= 9
+            && bytes[1] < 128
+            && bytes.last() != Some(&0)
+        {
+            let mut packed = [0; 8];
+            packed[..bytes.len() - 1].copy_from_slice(&bytes[1..]);
+            return u64::from_be_bytes(packed);
         }
         let mut dictionary = self.other.lock().unwrap();
         let (keys, names) = &mut *dictionary;
@@ -46,7 +55,8 @@ impl Ids {
         }
         let mut name = [self.prefix; 9];
         name[1..].copy_from_slice(&key.to_be_bytes());
-        name.into()
+        let len = 1 + name.iter().rposition(|&b| b != 0).unwrap();
+        name[..len].into()
     }
 }
 
@@ -58,6 +68,11 @@ mod tests {
     fn packed_and_interned_ids_preserve_bytes_and_order() {
         let ids = Ids::new(b'u');
         let names: &[&[u8]] = &[
+            b"u1",
+            b"u10",
+            b"u1\0",
+            b"u1\0x",
+            b"u1234567",
             b"u12345678",
             b"U12345678",
             b"u",
