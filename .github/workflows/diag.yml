@@ -1,0 +1,34 @@
+name: Native CSV and timestamp diagnostics
+on:
+  push:
+    branches: [codex/parser-diagnostics]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set -eu
+          grep -qw avx2 /proc/cpuinfo
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup override set 1.94.0
+          python -m pip install polars==2.1.0
+          cargo build --release --manifest-path bench/gen/Cargo.toml
+          gen=bench/gen/target/release/generate
+          "$gen" --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          "$gen" --seed 42 --events 20000000 --clicks 5000000 --output /tmp/shop-input
+          for v in parser radix click time; do git apply bench/$v.patch; done
+          cat bench/differential.rs >> src/input.rs
+          cargo test --release --locked
+          cargo build --release --locked
+          DATA_DIR=/tmp/dev OUTPUT_DIR=/tmp/dev-out target/release/shopping-sessions
+          python bench/digest.py /tmp/dev-out > /tmp/digest
+          diff bench/dev-digest /tmp/digest
+          python scripts/run_fixtures.py fixtures -- target/release/shopping-sessions
+          cp bench/diagnostic.rs src/main.rs
+          cargo build --release --locked
+          target/release/shopping-sessions scalar
+          target/release/shopping-sessions vector
