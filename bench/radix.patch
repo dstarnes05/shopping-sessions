@@ -1,0 +1,61 @@
+diff --git a/src/main.rs b/src/main.rs
+index f8e8367..3eeb9ac 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -129,6 +129,8 @@ struct Candidate {
+     event: Event,
+ }
+ 
++mod radix;
++
+ const SHARDS: usize = 256;
+ const PARTITIONS_PER_FILE: usize = 8;
+ 
+@@ -360,7 +362,7 @@ fn main() -> Result<()> {
+     let events = partitions();
+     candidates.into_par_iter().for_each(|partition| {
+         let mut records = partition.into_inner().unwrap();
+-        records.sort_unstable_by_key(|record| record.id);
++        radix::group(&mut records);
+         let mut batches = vec![Vec::new(); SHARDS];
+         for copies in records.chunk_by(|a, b| a.id == b.id) {
+             let winner = copies.iter().min_by_key(|record| record.ingest).unwrap();
+diff --git a/src/radix.rs b/src/radix.rs
+new file mode 100644
+index 0000000..3bea955
+--- /dev/null
++++ b/src/radix.rs
+@@ -0,0 +1,33 @@
++use crate::Candidate;
++
++// The upper eight hash bits already select the owning partition. Refine by
++// the next byte, then sort cache-sized buckets by exact ID.
++pub fn group(records: &mut [Candidate]) {
++    if records.len() < 2048 {
++        records.sort_unstable_by_key(|r| r.id);
++        return;
++    }
++    let bucket = |id: u64| ((id.wrapping_mul(0x9e3779b97f4a7c15) >> 48) & 255) as usize;
++    let mut ends = [0usize; 256];
++    for r in records.iter() {
++        ends[bucket(r.id)] += 1;
++    }
++    let mut next = [0usize; 256];
++    let mut offset = 0;
++    for i in 0..256 {
++        next[i] = offset;
++        offset += ends[i];
++        ends[i] = offset;
++    }
++    let mut start = 0;
++    for i in 0..256 {
++        while next[i] < ends[i] {
++            let pos = next[i];
++            let dest = bucket(records[pos].id);
++            records.swap(pos, next[dest]);
++            next[dest] += 1;
++        }
++        records[start..ends[i]].sort_unstable_by_key(|r| r.id);
++        start = ends[i];
++    }
++}

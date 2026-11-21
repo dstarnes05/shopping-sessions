@@ -1,0 +1,43 @@
+diff --git a/src/input.rs b/src/input.rs
+index 84f783b..dadda99 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -121,6 +121,28 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
+     Some(days * DAY + ((hour * 60 + minute - offset) * 60 + second) * 1000)
+ }
+ 
++// Parse the common 13-digit epoch form. All other lengths use the full grammar.
++fn epoch13(bytes: &[u8]) -> Option<i64> {
++    let word = u64::from_le_bytes(bytes[..8].try_into().unwrap());
++    const HIGH: u64 = 0xf0f0f0f0f0f0f0f0;
++    const ASCII: u64 = 0x3030303030303030;
++    if word & HIGH != ASCII || (word.wrapping_add(0x0606060606060606) & HIGH) != ASCII {
++        return None;
++    }
++    let digits = word ^ ASCII;
++    let pairs = (digits.wrapping_mul(10) + (digits >> 8)) & 0x00ff00ff00ff00ff;
++    let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000ffff0000ffff;
++    let prefix = (quads & 0xffff) * 10000 + (quads >> 32);
++    let mut value = prefix as i64;
++    for &byte in &bytes[8..] {
++        if !byte.is_ascii_digit() {
++            return None;
++        }
++        value = value * 10 + i64::from(byte - b'0');
++    }
++    Some(value)
++}
++
+ const SCAN_CHUNK: u64 = 2 * 1024 * 1024;
+ 
+ pub fn scan_chunks(paths: &[PathBuf], visit: impl Fn(&[u8]) + Sync) -> crate::Result<()> {
+@@ -212,6 +234,9 @@ pub struct Dates {
+ 
+ impl Dates {
+     pub fn parse(&mut self, value: &[u8]) -> Option<i64> {
++        if value.len() == 13 {
++            return epoch13(value);
++        }
+         if value.len() != 20 || value[19] != b'Z' {
+             return timestamp(value);
+         }

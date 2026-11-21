@@ -1,0 +1,151 @@
+diff --git a/src/block.rs b/src/block.rs
+new file mode 100644
+index 0000000..98a1495
+--- /dev/null
++++ b/src/block.rs
+@@ -0,0 +1,60 @@
++//! Parse newline-bounded CSV chunks using the challenge's restricted quoting grammar.
++use std::arch::x86_64::*;
++
++#[target_feature(enable = "avx2")]
++pub unsafe fn visit<const N: usize>(chunk: &[u8], mut visit: impl FnMut([&[u8]; N])) {
++    let mut fields = [&[][..]; N];
++    let mut index = 0;
++    let mut start = 0;
++    let mut quotes = 0;
++    let mut valid = true;
++    let mut base = 0;
++    while base <= chunk.len() {
++        let remaining = chunk.len() - base;
++        let mut tail = [0u8; 32];
++        let ptr = if remaining < 32 {
++            tail[..remaining].copy_from_slice(&chunk[base..]);
++            tail[remaining] = b'\n';
++            tail.as_ptr()
++        } else {
++            chunk[base..].as_ptr()
++        };
++        // Both paths provide 32 readable bytes. The tail's synthetic newline
++        // terminates a final row when the input has no trailing newline.
++        let bytes = _mm256_loadu_si256(ptr.cast());
++        let eq = |b| _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b));
++        let newlines = _mm256_movemask_epi8(eq(10)) as u32;
++        let mut delimiters = newlines | _mm256_movemask_epi8(eq(44)) as u32;
++        let mut quote_mask = _mm256_movemask_epi8(eq(34)) as u32;
++        while delimiters != 0 {
++            let bit = delimiters & delimiters.wrapping_neg();
++            let end = base + bit.trailing_zeros() as usize;
++            let before = bit - 1;
++            quotes += (quote_mask & before).count_ones() as usize;
++            quote_mask &= !before;
++            if index < N {
++                let raw = &chunk[start..end];
++                match quotes {
++                    0 => fields[index] = raw,
++                    2 if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' => {
++                        fields[index] = &raw[1..raw.len() - 1];
++                    }
++                    _ => valid = false,
++                }
++            }
++            index += 1;
++            start = end + 1;
++            quotes = 0;
++            if newlines & bit != 0 {
++                if valid && index == N {
++                    visit(fields);
++                }
++                valid = true;
++                index = 0;
++            }
++            delimiters &= delimiters - 1;
++        }
++        quotes += quote_mask.count_ones() as usize;
++        base += 32;
++    }
++}
+diff --git a/src/input.rs b/src/input.rs
+index 84f783b..96ad798 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -239,3 +239,12 @@ impl Dates {
+             .then(|| midnight + ((hour * 60 + minute) * 60 + second) * 1000)
+     }
+ }
++
++pub fn visit_rows<const N: usize>(chunk: &[u8], visit: impl FnMut([&[u8]; N])) {
++    #[cfg(target_arch = "x86_64")]
++    if std::arch::is_x86_feature_detected!("avx2") {
++        // The runtime check satisfies visit's target-feature precondition.
++        return unsafe { crate::block::visit(chunk, visit) };
++    }
++    data_rows::<N>(chunk).for_each(visit)
++}
+diff --git a/src/main.rs b/src/main.rs
+index f8e8367..6e8f6fb 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,5 @@
++#[cfg(target_arch = "x86_64")]
++mod block;
+ mod ids;
+ use ahash::AHashMap;
+ mod input;
+@@ -322,12 +324,12 @@ fn main() -> Result<()> {
+     scan_chunks(&files(&data.join("events"))?, |chunk| {
+         let mut batches = vec![Vec::new(); SHARDS];
+         let mut dates = input::Dates::default();
+-        for values in input::data_rows::<7>(chunk) {
++        input::visit_rows::<7>(chunk, |values| {
+             if values[0].is_empty() {
+-                continue;
++                return;
+             }
+             let Some(ingest) = dates.parse(values[3]) else {
+-                continue;
++                return;
+             };
+             let id = event_ids.encode(values[0]);
+             // Invalid winners suppress later copies. No accepted timestamp can
+@@ -350,7 +352,7 @@ fn main() -> Result<()> {
+                 user,
+                 event,
+             });
+-        }
++        });
+         flush(batches, &candidates);
+     })?;
+     eprintln!("Event scan: {:.2?}", ingest_started.elapsed());
+@@ -381,18 +383,18 @@ fn main() -> Result<()> {
+     scan_chunks(&files(&data.join("clicks"))?, |chunk| {
+         let mut batches: Vec<Vec<_>> = (0..SHARDS).map(|_| Vec::new()).collect();
+         let mut dates = input::Dates::default();
+-        for [id, user, campaign, time] in input::data_rows::<4>(chunk) {
++        input::visit_rows::<4>(chunk, |[id, user, campaign, time]| {
+             if id.is_empty() || user.is_empty() {
+-                continue;
++                return;
+             }
+             let Some(&campaign) = campaign_ids.get(campaign) else {
+-                continue;
++                return;
+             };
+             let Some(time) = dates.parse(time) else {
+-                continue;
++                return;
+             };
+             if !(window.0 - WEEK..window.1).contains(&time) {
+-                continue;
++                return;
+             }
+             let user = canonical(users.encode(user));
+             batches[shard(user)].push((
+@@ -403,7 +405,7 @@ fn main() -> Result<()> {
+                     campaign,
+                 },
+             ));
+-        }
++        });
+         flush(batches, &clicks);
+     })?;
+     let output_started = Instant::now();

@@ -1,0 +1,91 @@
+diff --git a/src/main.rs b/src/main.rs
+index f8e8367..57d95d0 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -187,19 +187,11 @@ fn validate_event(
+ 
+ fn summarize(
+     events: &mut [Event],
+-    clicks: &mut Vec<Click>,
++    clicks: &[(u64, Click)],
+     organic: usize,
+-    click_ids: &ids::Ids,
+     campaign_days: &mut HashMap<(usize, i32), CampaignDay>,
+ ) -> HashMap<i32, UserDay> {
+     events.sort_unstable_by_key(|event| event.time);
+-    // Put the smallest ID last at a tied timestamp so the last eligible click wins.
+-    clicks.sort_unstable_by(|a, b| {
+-        a.time
+-            .cmp(&b.time)
+-            .then_with(|| click_ids.compare(b.id, a.id))
+-    });
+-    clicks.dedup_by(|a, b| a.id == b.id);
+     let mut user_days = HashMap::<i32, UserDay>::new();
+     let mut active = HashMap::<usize, usize>::new();
+     let (mut first, mut next) = (0, 0);
+@@ -227,12 +219,12 @@ fn summarize(
+         daily.events += count as i64;
+         daily.revenue += revenue;
+ 
+-        while next < clicks.len() && clicks[next].time <= start {
+-            *active.entry(clicks[next].campaign).or_default() += 1;
++        while next < clicks.len() && clicks[next].1.time <= start {
++            *active.entry(clicks[next].1.campaign).or_default() += 1;
+             next += 1;
+         }
+-        while first < next && clicks[first].time < start - WEEK {
+-            let Entry::Occupied(mut count) = active.entry(clicks[first].campaign) else {
++        while first < next && clicks[first].1.time < start - WEEK {
++            let Entry::Occupied(mut count) = active.entry(clicks[first].1.campaign) else {
+                 unreachable!("each expired click was active");
+             };
+             *count.get_mut() -= 1;
+@@ -242,7 +234,7 @@ fn summarize(
+             first += 1;
+         }
+         let credited = if first < next {
+-            clicks[next - 1].campaign
++            clicks[next - 1].1.campaign
+         } else {
+             organic
+         };
+@@ -433,11 +425,14 @@ fn main() -> Result<()> {
+             if let Some(start) = profile_started {
+                 writing += start.elapsed();
+             }
+-            for (mut events, clicks) in partitions {
+-                let mut by_user = HashMap::<u64, Vec<Click>>::new();
+-                for (user, click) in clicks {
+-                    by_user.entry(user).or_default().push(click);
+-                }
++            for (mut events, mut clicks) in partitions {
++                clicks.sort_unstable_by(|(u, a), (v, b)| {
++                    u.cmp(v)
++                        .then_with(|| a.time.cmp(&b.time))
++                        .then_with(|| click_ids.compare(b.id, a.id))
++                });
++                clicks.dedup_by(|a, b| a.1.id == b.1.id);
++                let mut click_groups = clicks.chunk_by(|a, b| a.0 == b.0).peekable();
+                 events.sort_unstable_by_key(|record| record.0);
+                 let mut person_events = Vec::new();
+                 for group in events.chunk_by(|a, b| a.0 == b.0) {
+@@ -445,14 +440,11 @@ fn main() -> Result<()> {
+                     person_events.extend(group.iter().map(|row| row.1));
+                     let user_id = group[0].0;
+                     let user = users.decode(user_id);
+-                    let mut clicks = by_user.remove(&user_id).unwrap_or_default();
+-                    let days = summarize(
+-                        &mut person_events,
+-                        &mut clicks,
+-                        organic,
+-                        &click_ids,
+-                        &mut campaign_days,
+-                    );
++                    while click_groups.next_if(|g| g[0].0 < user_id).is_some() {}
++                    let clicks = click_groups
++                        .next_if(|g| g[0].0 == user_id)
++                        .unwrap_or_default();
++                    let days = summarize(&mut person_events, clicks, organic, &mut campaign_days);
+                     let write_started = profile.then(Instant::now);
+                     for (day, daily) in days {
+                         let top = daily

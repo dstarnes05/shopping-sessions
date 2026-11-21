@@ -1,0 +1,20 @@
+name: Block parsing and grouping experiments
+on:
+  push:
+    branches: [codex/block-benchmark]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          lscpu
+          grep -qw avx2 /proc/cpuinfo
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup override set 1.94.0
+          python -m pip install polars
+          cargo build --release --locked --manifest-path bench/gen/Cargo.toml
+          bash bench/run.sh
