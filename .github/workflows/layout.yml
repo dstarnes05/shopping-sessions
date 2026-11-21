@@ -1,26 +1,30 @@
-name: Native layout and profile optimization benchmark
+name: Check submission image
 on:
   push:
     branches: [codex/layout-benchmark]
 permissions:
   contents: read
 jobs:
-  compare:
+  verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
-      - id: cpu
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: fc28af217a51606b4f8c839789b623313f137ca6
+          path: candidate
+      - working-directory: candidate
+        env:
+          CPUS: 4
+          MEM: 12g
         run: |
           lscpu
-          if grep -q GenuineIntel /proc/cpuinfo; then echo 'intel=yes' >> "$GITHUB_OUTPUT"; fi
-      - uses: actions/checkout@v4
-        if: steps.cpu.outputs.intel == 'yes'
-        with:
-          fetch-depth: 0
-      - if: steps.cpu.outputs.intel == 'yes'
-        run: |
-          rustup toolchain install 1.94.0 --profile minimal
-          rustup override set 1.94.0
+          timeout 600 make build
           python -m pip install polars==2.1.0
-          cargo build --release --locked --manifest-path bench/gen/Cargo.toml
-          bash bench/run.sh
+          python scripts/run_fixtures.py fixtures -- scripts/docker_run.sh
+          cargo build --release --locked --manifest-path training/generator/Cargo.toml
+          training/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
+          scripts/docker_run.sh /tmp/dev /tmp/dev-out
+          python ../bench/digest.py /tmp/dev-out > /tmp/digest
+          diff ../bench/dev-digest /tmp/digest
