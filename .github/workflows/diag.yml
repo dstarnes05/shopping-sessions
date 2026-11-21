@@ -1,34 +1,40 @@
-name: Native CSV and timestamp diagnostics
+name: Intel candidate confirmation
 on:
   push:
     branches: [codex/parser-diagnostics]
 permissions:
   contents: read
 jobs:
-  check:
+  confirm:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
+      - id: cpu
+        run: |
+          lscpu
+          if grep -q GenuineIntel /proc/cpuinfo; then echo 'intel=yes' >> "$GITHUB_OUTPUT"; fi
       - uses: actions/checkout@v4
-      - run: |
+        if: steps.cpu.outputs.intel == 'yes'
+      - if: steps.cpu.outputs.intel == 'yes'
+        run: |
           set -eu
-          grep -qw avx2 /proc/cpuinfo
           rustup toolchain install 1.94.0 --profile minimal
           rustup override set 1.94.0
-          python -m pip install polars==2.1.0
+          python -m pip install polars
           cargo build --release --manifest-path bench/gen/Cargo.toml
-          gen=bench/gen/target/release/generate
-          "$gen" --seed 1 --events 1000000 --clicks 250000 --output /tmp/dev
-          "$gen" --seed 42 --events 20000000 --clicks 5000000 --output /tmp/shop-input
+          cargo build --release --locked
+          cp target/release/shopping-sessions /tmp/base
           for v in parser radix click time; do git apply bench/$v.patch; done
-          cat bench/differential.rs >> src/input.rs
-          cargo test --release --locked
           cargo build --release --locked
-          DATA_DIR=/tmp/dev OUTPUT_DIR=/tmp/dev-out target/release/shopping-sessions
-          python bench/digest.py /tmp/dev-out > /tmp/digest
-          diff bench/dev-digest /tmp/digest
-          python scripts/run_fixtures.py fixtures -- target/release/shopping-sessions
-          cp bench/diagnostic.rs src/main.rs
-          cargo build --release --locked
-          target/release/shopping-sessions scalar
-          target/release/shopping-sessions vector
+          cp target/release/shopping-sessions /tmp/best
+          export NCPU="$(nproc)" DATA_DIR=/tmp/input
+          for seed in 42 98 99; do
+            size=20000000; if [ "$seed" = 99 ]; then size=60000000; fi
+            bench/gen/target/release/generate --seed "$seed" --events "$size" --clicks "$((size/4))" --output "$DATA_DIR"
+            OUTPUT_DIR=/tmp/out-base /tmp/base
+            for v in base best best base base best; do
+              OUTPUT_DIR="/tmp/out-$v" /usr/bin/time -f "INTEL $seed $v %e %M" "/tmp/$v"
+            done
+            python scripts/compare.py /tmp/out-base /tmp/out-best
+            rm -rf /tmp/input /tmp/out-base /tmp/out-best
+          done
