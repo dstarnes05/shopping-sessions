@@ -1,3 +1,5 @@
+mod ids;
+use ahash::AHashMap;
 mod input;
 mod output;
 
@@ -6,13 +8,12 @@ use std::{
     env,
     error::Error,
     fs,
-    hash::{BuildHasher, RandomState},
     path::PathBuf,
     sync::Mutex,
     time::Instant,
 };
 
-use input::{decimal, fields, files, rows, scan, scan_chunks, timestamp, DAY, WEEK};
+use input::{decimal, files, rows, scan_chunks, timestamp, DAY, WEEK};
 use rayon::prelude::*;
 
 type Bytes = Box<[u8]>;
@@ -20,21 +21,21 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 #[derive(Default)]
 struct People {
-    ids: HashMap<Bytes, usize>,
-    names: Vec<Bytes>,
+    ids: AHashMap<u64, usize>,
+    names: Vec<u64>,
     parents: Vec<usize>,
     sizes: Vec<usize>,
     minimum: Vec<usize>,
 }
 
 impl People {
-    fn intern(&mut self, name: &[u8]) -> usize {
-        if let Some(&id) = self.ids.get(name) {
+    fn intern(&mut self, name: u64) -> usize {
+        if let Some(&id) = self.ids.get(&name) {
             return id;
         }
         let id = self.names.len();
-        self.ids.insert(name.into(), id);
-        self.names.push(name.into());
+        self.ids.insert(name, id);
+        self.names.push(name);
         self.parents.push(id);
         self.sizes.push(1);
         self.minimum.push(id);
@@ -49,7 +50,7 @@ impl People {
         id
     }
 
-    fn join(&mut self, left: &[u8], right: &[u8]) {
+    fn join(&mut self, left: u64, right: u64, users: &ids::Ids) {
         let left = self.intern(left);
         let right = self.intern(right);
         let (mut left, mut right) = (self.root(left), self.root(right));
@@ -61,12 +62,18 @@ impl People {
         }
         self.parents[right] = left;
         self.sizes[left] += self.sizes[right];
-        if self.names[self.minimum[right]] < self.names[self.minimum[left]] {
+        if users
+            .compare(
+                self.names[self.minimum[right]],
+                self.names[self.minimum[left]],
+            )
+            .is_lt()
+        {
             self.minimum[left] = self.minimum[right];
         }
     }
 
-    fn finish(mut self) -> HashMap<Bytes, Bytes> {
+    fn finish(mut self) -> AHashMap<u64, u64> {
         let canonical: Vec<_> = (0..self.names.len())
             .map(|id| {
                 let root = self.root(id);
@@ -76,7 +83,7 @@ impl People {
         self.ids
             .into_iter()
             .filter_map(|(name, id)| {
-                (id != canonical[id]).then(|| (name, self.names[canonical[id]].clone()))
+                (id != canonical[id]).then(|| (name, self.names[canonical[id]]))
             })
             .collect()
     }
@@ -92,7 +99,7 @@ struct Event {
 struct Click {
     time: i64,
     campaign: usize,
-    id: Bytes,
+    id: u64,
 }
 
 #[derive(Default)]
@@ -111,57 +118,45 @@ struct CampaignDay {
     assists: i64,
 }
 
+#[derive(Clone, Copy)]
 struct Candidate {
+    id: u64,
     ingest: i64,
-    valid: Option<(Bytes, Event)>,
-}
-
-struct Shards<T> {
-    maps: Vec<Mutex<HashMap<Bytes, T>>>,
-    hash: RandomState,
+    user: u64,
+    event: Event,
 }
 
 const SHARDS: usize = 256;
 
-impl<T> Shards<T> {
-    fn new() -> Self {
-        Self {
-            maps: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
-            hash: RandomState::new(),
-        }
-    }
-
-    fn index(&self, id: &[u8]) -> usize {
-        self.hash.hash_one(id) as usize % SHARDS
-    }
-
-    fn update(&self, id: &[u8], update: impl FnOnce(&mut HashMap<Bytes, T>)) {
-        let shard = self.index(id);
-        update(&mut self.maps[shard].lock().unwrap());
-    }
-
-    fn into_maps(self) -> impl Iterator<Item = HashMap<Bytes, T>> {
-        self.maps.into_iter().map(|map| map.into_inner().unwrap())
-    }
+fn shard(id: u64) -> usize {
+    (id.wrapping_mul(0x9e3779b97f4a7c15) >> 56) as usize
 }
 
-fn canonical<'a>(aliases: &'a HashMap<Bytes, Bytes>, id: &'a [u8]) -> &'a [u8] {
-    aliases.get(id).map_or(id, |alias| alias.as_ref())
+fn partitions<T>() -> Vec<Mutex<Vec<T>>> {
+    (0..SHARDS).map(|_| Mutex::new(Vec::new())).collect()
+}
+
+fn flush<T>(batches: Vec<Vec<T>>, partitions: &[Mutex<Vec<T>>]) {
+    for (mut batch, destination) in batches.into_iter().zip(partitions) {
+        if !batch.is_empty() {
+            destination.lock().unwrap().append(&mut batch);
+        }
+    }
 }
 
 fn validate_event(
+    dates: &mut input::Dates,
     values: [&[u8]; 7],
     ingest: i64,
     window: (i64, i64),
-    aliases: &HashMap<Bytes, Bytes>,
     products: &HashMap<Bytes, u32>,
     unknown: u32,
-) -> Option<(Bytes, Event)> {
+) -> Option<Event> {
     let [_, user, time, _, kind, product, price] = values;
     if user.is_empty() || product.is_empty() {
         return None;
     }
-    let time = timestamp(time)?;
+    let time = dates.parse(time)?;
     if !(window.0..window.1).contains(&time) || ingest - time > DAY {
         return None;
     }
@@ -179,25 +174,27 @@ fn validate_event(
         }
         _ => return None,
     };
-    Some((
-        canonical(aliases, user).into(),
-        Event {
-            time,
-            revenue,
-            category,
-        },
-    ))
+    Some(Event {
+        time,
+        revenue,
+        category,
+    })
 }
 
 fn summarize(
     events: &mut [Event],
     clicks: &mut Vec<Click>,
     organic: usize,
+    click_ids: &ids::Ids,
     campaign_days: &mut HashMap<(usize, i32), CampaignDay>,
 ) -> HashMap<i32, UserDay> {
     events.sort_unstable_by_key(|event| event.time);
     // Put the smallest ID last at a tied timestamp so the last eligible click wins.
-    clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| b.id.cmp(&a.id)));
+    clicks.sort_unstable_by(|a, b| {
+        a.time
+            .cmp(&b.time)
+            .then_with(|| click_ids.compare(b.id, a.id))
+    });
     clicks.dedup_by(|a, b| a.id == b.id);
     let mut user_days = HashMap::<i32, UserDay>::new();
     let mut active = HashMap::<usize, usize>::new();
@@ -275,15 +272,17 @@ fn main() -> Result<()> {
     };
     let window = (bound("window_start")?, bound("window_end")?);
 
+    let users = ids::Ids::new(b'u');
     let mut people = People::default();
     for path in files(&data.join("links"))? {
         for [left, right] in rows(&fs::read(path)?) {
             if !left.is_empty() && !right.is_empty() {
-                people.join(left, right);
+                people.join(users.encode(left), users.encode(right), &users);
             }
         }
     }
     let aliases = people.finish();
+    let canonical = |id| aliases.get(&id).copied().unwrap_or(id);
 
     let products_raw = fs::read(data.join("products.csv"))?;
     let mut categories: Vec<&[u8]> = rows::<2>(&products_raw)
@@ -313,125 +312,129 @@ fn main() -> Result<()> {
         .map(|(index, &(name, _))| (name, index))
         .collect();
 
-    let candidates = Shards::<Candidate>::new();
+    let event_ids = ids::Ids::new(b'e');
+    let candidates = partitions();
     let ingest_started = Instant::now();
     scan_chunks(&files(&data.join("events"))?, |chunk| {
-        let mut batches: [_; SHARDS] = std::array::from_fn(|_| Vec::new());
-        for line in chunk.split(|&byte| byte == b'\n') {
-            let Some(values) = fields::<7>(line) else {
-                continue;
-            };
-            let id = values[0];
-            if id.is_empty() {
+        let mut batches = vec![Vec::new(); SHARDS];
+        let mut dates = input::Dates::default();
+        for values in input::data_rows::<7>(chunk) {
+            if values[0].is_empty() {
                 continue;
             }
-            let Some(ingest) = timestamp(values[3]) else {
+            let Some(ingest) = dates.parse(values[3]) else {
                 continue;
             };
-            // Invalid candidates remain eligible to suppress later valid copies.
-            let candidate = Candidate {
+            let id = event_ids.encode(values[0]);
+            // Invalid winners suppress later copies. No accepted timestamp can
+            // equal i64::MIN under the supported timestamp grammar.
+            let (user, event) =
+                match validate_event(&mut dates, values, ingest, window, &products, unknown) {
+                    Some(event) => (users.encode(values[1]), event),
+                    None => (
+                        0,
+                        Event {
+                            time: i64::MIN,
+                            revenue: 0,
+                            category: 0,
+                        },
+                    ),
+                };
+            batches[shard(id)].push(Candidate {
+                id,
                 ingest,
-                valid: validate_event(values, ingest, window, &aliases, &products, unknown),
-            };
-            let shard = candidates.index(id);
-            batches[shard].push((id, candidate));
+                user,
+                event,
+            });
         }
-        for (shard, batch) in batches.into_iter().enumerate() {
-            if batch.is_empty() {
-                continue;
-            }
-            let mut map = candidates.maps[shard].lock().unwrap();
-            for (id, candidate) in batch {
-                if let Some(current) = map.get_mut(id) {
-                    if candidate.ingest < current.ingest {
-                        *current = candidate;
-                    }
-                } else {
-                    map.insert(id.into(), candidate);
-                }
-            }
-        }
+        flush(batches, &candidates);
     })?;
-    eprintln!(
-        "Event ingestion and deduplication: {:.2?}",
-        ingest_started.elapsed()
-    );
+    eprintln!("Event scan: {:.2?}", ingest_started.elapsed());
+    drop(event_ids);
 
     let grouping_started = Instant::now();
-    let events = Shards::<Vec<Event>>::new();
-    candidates
-        .into_maps()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .for_each(|map| {
-            for (user, event) in map.into_values().filter_map(|candidate| candidate.valid) {
-                events.update(&user, |map| {
-                    if let Some(records) = map.get_mut(user.as_ref()) {
-                        records.push(event);
-                    } else {
-                        map.insert(user.clone(), vec![event]);
-                    }
-                });
+    let events = partitions();
+    candidates.into_par_iter().for_each(|partition| {
+        let mut records = partition.into_inner().unwrap();
+        records.sort_unstable_by_key(|record| record.id);
+        let mut batches = vec![Vec::new(); SHARDS];
+        for copies in records.chunk_by(|a, b| a.id == b.id) {
+            let winner = copies.iter().min_by_key(|record| record.ingest).unwrap();
+            if winner.event.time != i64::MIN {
+                let user = canonical(winner.user);
+                batches[shard(user)].push((user, winner.event));
             }
-        });
+        }
+        flush(batches, &events);
+    });
+    eprintln!(
+        "Deduplication and event grouping: {:.2?}",
+        grouping_started.elapsed()
+    );
 
-    eprintln!("Event grouping: {:.2?}", grouping_started.elapsed());
-    let click_started = Instant::now();
-    let clicks = Shards::<Vec<Click>> {
-        hash: events.hash.clone(),
-        ..Shards::new()
-    };
-    scan(
-        &files(&data.join("clicks"))?,
-        |[id, user, campaign, time]| {
+    let click_ids = ids::Ids::new(b'k');
+    let clicks = partitions();
+    scan_chunks(&files(&data.join("clicks"))?, |chunk| {
+        let mut batches: Vec<Vec<_>> = (0..SHARDS).map(|_| Vec::new()).collect();
+        let mut dates = input::Dates::default();
+        for [id, user, campaign, time] in input::data_rows::<4>(chunk) {
             if id.is_empty() || user.is_empty() {
-                return;
+                continue;
             }
             let Some(&campaign) = campaign_ids.get(campaign) else {
-                return;
+                continue;
             };
-            let Some(time) = timestamp(time) else {
-                return;
+            let Some(time) = dates.parse(time) else {
+                continue;
             };
             if !(window.0 - WEEK..window.1).contains(&time) {
-                return;
+                continue;
             }
-            let user = canonical(&aliases, user);
-            // A click ID's copies are identical. Collapse them during the sorted sweep.
-            clicks.update(user, |map| {
-                let click = Click {
+            let user = canonical(users.encode(user));
+            batches[shard(user)].push((
+                user,
+                Click {
+                    id: click_ids.encode(id),
                     time,
                     campaign,
-                    id: id.into(),
-                };
-                if let Some(records) = map.get_mut(user) {
-                    records.push(click);
-                } else {
-                    map.insert(user.into(), vec![click]);
-                }
-            });
-        },
-    )?;
-    eprintln!(
-        "Click ingestion and grouping: {:.2?}",
-        click_started.elapsed()
-    );
+                },
+            ));
+        }
+        flush(batches, &clicks);
+    })?;
     let output_started = Instant::now();
 
     fs::create_dir_all(destination.join("user_daily"))?;
-    let pairs: Vec<_> = events.into_maps().zip(clicks.into_maps()).collect();
+    let pairs: Vec<_> = events.into_iter().zip(clicks).collect();
     let totals: Vec<HashMap<(usize, i32), CampaignDay>> = pairs
         .into_par_iter()
         .enumerate()
-        .map(|(index, (events, mut clicks))| -> Result<_> {
+        .map(|(index, (events, clicks))| -> Result<_> {
             let mut campaign_days = HashMap::new();
+            let mut events = events.into_inner().unwrap();
             if events.is_empty() && index != 0 {
                 return Ok(campaign_days);
             }
             let mut writer = output::UserWriter::new(&destination, index)?;
-            for (user, mut events) in events {
-                let mut clicks = clicks.remove(&user).unwrap_or_default();
-                let days = summarize(&mut events, &mut clicks, organic, &mut campaign_days);
+            let mut by_user = HashMap::<u64, Vec<Click>>::new();
+            for (user, click) in clicks.into_inner().unwrap() {
+                by_user.entry(user).or_default().push(click);
+            }
+            events.sort_unstable_by_key(|record| record.0);
+            let mut person_events = Vec::new();
+            for group in events.chunk_by(|a, b| a.0 == b.0) {
+                let user_id = group[0].0;
+                let user = users.decode(user_id);
+                person_events.clear();
+                person_events.extend(group.iter().map(|record| record.1));
+                let mut clicks = by_user.remove(&user_id).unwrap_or_default();
+                let days = summarize(
+                    &mut person_events,
+                    &mut clicks,
+                    organic,
+                    &click_ids,
+                    &mut campaign_days,
+                );
                 for (day, daily) in days {
                     let top = daily
                         .categories

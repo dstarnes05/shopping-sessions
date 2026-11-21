@@ -169,19 +169,6 @@ fn read_chunk(
     Ok(())
 }
 
-pub fn scan<const N: usize>(
-    paths: &[PathBuf],
-    visit: impl Fn([&[u8]; N]) + Sync,
-) -> crate::Result<()> {
-    scan_chunks(paths, |chunk| {
-        for line in chunk.split(|&byte| byte == b'\n') {
-            if let Some(values) = fields(line) {
-                visit(values);
-            }
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +189,53 @@ mod tests {
             }
             assert_eq!(collected, expected, "chunk size {chunk_size}");
         }
+    }
+}
+
+pub fn data_rows<const N: usize>(chunk: &[u8]) -> impl Iterator<Item = [&[u8]; N]> {
+    let mut start = 0;
+    memchr::memchr_iter(b'\n', chunk)
+        .chain(std::iter::once(chunk.len()))
+        .filter_map(move |end| {
+            let line = chunk.get(start..end)?;
+            start = end + 1;
+            fields(line)
+        })
+}
+
+// Cache validated calendar dates within each chunk. A cache miss goes through
+// the full timestamp grammar, including calendar and offset validation.
+#[derive(Default)]
+pub struct Dates {
+    entries: [Option<([u8; 11], i64)>; 32],
+}
+
+impl Dates {
+    pub fn parse(&mut self, value: &[u8]) -> Option<i64> {
+        if value.len() != 20 || value[19] != b'Z' {
+            return timestamp(value);
+        }
+        let key: &[u8; 11] = value[..11].try_into().unwrap();
+        let index = (usize::from(key[8]) * 10 + usize::from(key[9])) % 32;
+        let midnight = match self.entries[index] {
+            Some((date, midnight)) if date == *key => midnight,
+            _ => {
+                let time = timestamp(value)?;
+                self.entries[index] = Some((*key, time.div_euclid(DAY) * DAY));
+                return Some(time);
+            }
+        };
+        fn pair(a: u8, b: u8) -> Option<i64> {
+            (a.is_ascii_digit() && b.is_ascii_digit())
+                .then(|| i64::from((a - b'0') * 10 + b - b'0'))
+        }
+        if value[13] != b':' || value[16] != b':' {
+            return None;
+        }
+        let hour = pair(value[11], value[12])?;
+        let minute = pair(value[14], value[15])?;
+        let second = pair(value[17], value[18])?;
+        (hour < 24 && minute < 60 && second < 60)
+            .then(|| midnight + ((hour * 60 + minute) * 60 + second) * 1000)
     }
 }

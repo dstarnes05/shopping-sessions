@@ -26,8 +26,8 @@ Use an empty output directory for each run. The Docker image runs as UID 1000 wi
 ## Pipeline
 
 - Resolve linked identities with union-find and preserve the byte-wise minimum ID.
-- Scan events and clicks in parallel using newline-aligned byte ranges. Batch event deduplication updates by raw event-ID shard, retaining invalid earliest copies so later copies cannot rescue them.
+- Scan events and clicks in parallel using newline-aligned byte ranges. Encode common IDs reversibly in 64 bits and intern other byte strings. Partition compact event records by event ID and sort each partition to select the earliest copy, including invalid copies.
 - Group surviving events and valid clicks by canonical person, sort each person's records, and sweep the inclusive seven-day click window as sessions close.
 - Aggregate campaign-day results per shard and merge them. Write user-day results in bounded Parquet row groups.
 
-Deduplication and person groups stay in memory. The binary reports separate timings for event ingestion, event grouping, click ingestion, and session aggregation with Parquet output.
+Deduplication and person groups stay in memory. The binary reports elapsed time for the event scan, deduplication and grouping, and session aggregation with Parquet output.
