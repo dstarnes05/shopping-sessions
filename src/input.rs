@@ -1,6 +1,5 @@
 use std::{
-    fs,
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -148,53 +147,48 @@ const SCAN_CHUNK: u64 = 2 * 1024 * 1024;
 pub fn scan_chunks(paths: &[PathBuf], visit: impl Fn(&[u8]) + Sync) -> crate::Result<()> {
     use rayon::prelude::*;
 
-    let mut chunks = Vec::new();
+    let mut maps = Vec::new();
     for path in paths {
-        let len = fs::metadata(path)?.len();
-        for start in (0..len).step_by(SCAN_CHUNK as usize) {
-            chunks.push((path, start, (start + SCAN_CHUNK).min(len)));
+        let file = fs::File::open(path)?;
+        if file.metadata()?.len() != 0 {
+            // Scorer inputs are immutable for the lifetime of the run.
+            maps.push(unsafe { memmap2::MmapOptions::new().map(&file)? });
         }
     }
-    chunks
-        .into_par_iter()
-        .try_for_each_init(Vec::new, |buffer, (path, start, end)| {
-            let reader = BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
-            read_chunk(reader, start, end, buffer)?;
-            visit(buffer);
-            Ok(())
+    let chunks: Vec<_> = maps
+        .iter()
+        .flat_map(|map| {
+            (0..map.len())
+                .step_by(SCAN_CHUNK as usize)
+                .map(move |start| (map, start))
         })
+        .collect();
+    chunks.into_par_iter().for_each(|(map, start)| {
+        let end = (start + SCAN_CHUNK as usize).min(map.len());
+        visit(data_range(map, start, end));
+    });
+    Ok(())
 }
 
-fn read_chunk(
-    mut reader: impl BufRead + Seek,
-    start: u64,
-    end: u64,
-    buffer: &mut Vec<u8>,
-) -> io::Result<()> {
-    buffer.clear();
-    let first = if start == 0 {
-        // The first byte range owns the header, which is never a data row.
-        reader.read_until(b'\n', buffer)? as u64
-    } else {
-        reader.seek(SeekFrom::Start(start - 1))?;
-        // At a line boundary this consumes just the preceding newline.
-        // Otherwise the range where the line began owns it.
-        start - 1 + reader.read_until(b'\n', buffer)? as u64
+fn data_range(bytes: &[u8], start: usize, end: usize) -> &[u8] {
+    // Byte zero belongs to the header. Other ranges own lines whose first
+    // byte lies inside the range, including a final row without a newline.
+    let boundary = |pos: usize| {
+        let from = pos.saturating_sub(1);
+        memchr::memchr(b'\n', &bytes[from..]).map_or(bytes.len(), |n| from + n + 1)
     };
-    buffer.clear();
-    if first < end {
-        reader.by_ref().take(end - first).read_to_end(buffer)?;
-        if buffer.last().is_some_and(|&byte| byte != b'\n') {
-            reader.read_until(b'\n', buffer)?;
-        }
-    }
-    Ok(())
+    let first = boundary(start);
+    let last = if end == bytes.len() {
+        end
+    } else {
+        boundary(end)
+    };
+    &bytes[first..last]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
 
     #[test]
     fn ranges_cover_data_exactly_once() {
@@ -203,11 +197,10 @@ mod tests {
         let expected = &input[b"first,second\n".len()..];
         for chunk_size in 1..=input.len() {
             let mut collected = Vec::new();
-            let mut buffer = Vec::new();
+
             for start in (0..input.len()).step_by(chunk_size) {
                 let end = (start + chunk_size).min(input.len());
-                read_chunk(Cursor::new(input), start as u64, end as u64, &mut buffer).unwrap();
-                collected.extend_from_slice(&buffer);
+                collected.extend_from_slice(data_range(input, start, end));
             }
             assert_eq!(collected, expected, "chunk size {chunk_size}");
         }

@@ -7,6 +7,7 @@ pub unsafe fn visit<const N: usize>(chunk: &[u8], mut visit: impl FnMut([&[u8]; 
     let mut index = 0;
     let mut start = 0;
     let mut quotes = 0;
+    let mut wrapped = 0;
     let mut valid = true;
     let mut base = 0;
     while base <= chunk.len() {
@@ -29,26 +30,33 @@ pub unsafe fn visit<const N: usize>(chunk: &[u8], mut visit: impl FnMut([&[u8]; 
         while delimiters != 0 {
             let bit = delimiters & delimiters.wrapping_neg();
             let end = base + bit.trailing_zeros() as usize;
-            let before = bit - 1;
-            quotes += (quote_mask & before).count_ones() as usize;
-            quote_mask &= !before;
             if index < N {
                 let raw = &chunk[start..end];
-                match quotes {
-                    0 => fields[index] = raw,
-                    2 if raw.len() >= 2 && raw[0] == b'"' && raw[raw.len() - 1] == b'"' => {
-                        fields[index] = &raw[1..raw.len() - 1];
+                fields[index] = if raw.first() == Some(&b'"') {
+                    if raw.len() >= 2 && raw.last() == Some(&b'"') {
+                        wrapped += 1;
+                        &raw[1..raw.len() - 1]
+                    } else {
+                        valid = false;
+                        raw
                     }
-                    _ => valid = false,
-                }
+                } else {
+                    raw
+                };
             }
             index += 1;
             start = end + 1;
-            quotes = 0;
             if newlines & bit != 0 {
-                if valid && index == N {
+                // Every wrapped field accounts for two distinct quotes. Any
+                // remaining quote in the row is necessarily malformed.
+                let before = bit - 1;
+                quotes += (quote_mask & before).count_ones() as usize;
+                quote_mask &= !before;
+                if valid && index == N && quotes == 2 * wrapped {
                     visit(fields);
                 }
+                wrapped = 0;
+                quotes = 0;
                 valid = true;
                 index = 0;
             }

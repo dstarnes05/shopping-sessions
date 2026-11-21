@@ -3,3 +3,6 @@
 !Cargo.lock
 !src/
 !src/**
+!training/
+!training/**
+training/generator/target/

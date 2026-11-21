@@ -144,10 +144,10 @@ fn partitions<T>() -> Vec<Mutex<Vec<T>>> {
     (0..SHARDS).map(|_| Mutex::new(Vec::new())).collect()
 }
 
-fn flush<T>(batches: Vec<Vec<T>>, partitions: &[Mutex<Vec<T>>]) {
-    for (mut batch, destination) in batches.into_iter().zip(partitions) {
+fn publish_batches<T>(batches: Vec<Vec<T>>, partitions: &[Mutex<Vec<Vec<T>>>]) {
+    for (batch, destination) in batches.into_iter().zip(partitions) {
         if !batch.is_empty() {
-            destination.lock().unwrap().append(&mut batch);
+            destination.lock().unwrap().push(batch);
         }
     }
 }
@@ -231,7 +231,7 @@ impl ActiveCampaigns {
 
 fn summarize(
     events: &mut [Event],
-    clicks: &[(u64, Click)],
+    clicks: &[Click],
     organic: usize,
     active: &mut ActiveCampaigns,
     campaign_days: &mut AHashMap<i32, Vec<CampaignDay>>,
@@ -270,16 +270,16 @@ fn summarize(
         daily.events += count as i64;
         daily.revenue += revenue;
 
-        while next < clicks.len() && clicks[next].1.time <= start {
-            active.add(clicks[next].1.campaign);
+        while next < clicks.len() && clicks[next].time <= start {
+            active.add(clicks[next].campaign);
             next += 1;
         }
-        while first < next && clicks[first].1.time < start - WEEK {
-            active.remove(clicks[first].1.campaign);
+        while first < next && clicks[first].time < start - WEEK {
+            active.remove(clicks[first].campaign);
             first += 1;
         }
         let credited = if first < next {
-            clicks[next - 1].1.campaign
+            clicks[next - 1].campaign
         } else {
             organic
         };
@@ -397,11 +397,7 @@ fn main() -> Result<()> {
                         event,
                     });
                 });
-                for (batch, partition) in batches.into_iter().zip(&candidates) {
-                    if !batch.is_empty() {
-                        partition.lock().unwrap().push(batch);
-                    }
-                }
+                publish_batches(batches, &candidates);
             })
         },
     );
@@ -422,7 +418,7 @@ fn main() -> Result<()> {
                 batches[shard(user)].push((user, winner.event));
             }
         });
-        flush(batches, &events);
+        publish_batches(batches, &events);
     });
     eprintln!(
         "Deduplication and event grouping: {:.2?}",
@@ -457,7 +453,7 @@ fn main() -> Result<()> {
                 },
             ));
         });
-        flush(batches, &clicks);
+        publish_batches(batches, &clicks);
     })?;
     let output_started = Instant::now();
 
@@ -487,32 +483,60 @@ fn main() -> Result<()> {
             if let Some(start) = profile_started {
                 writing += start.elapsed();
             }
-            for (mut events, mut clicks) in partitions {
-                clicks.sort_unstable_by(|(u, a), (v, b)| {
-                    u.cmp(v)
-                        .then_with(|| a.time.cmp(&b.time))
-                        .then_with(|| click_ids.compare(b.id, a.id))
-                });
-                clicks.dedup_by(|a, b| a.1.id == b.1.id);
-                let mut click_groups = clicks.chunk_by(|a, b| a.0 == b.0).peekable();
-                events.sort_unstable_by_key(|record| record.0);
-                let mut person_events = Vec::new();
-                for group in events.chunk_by(|a, b| a.0 == b.0) {
-                    person_events.clear();
-                    person_events.extend(group.iter().map(|row| row.1));
-                    let user_id = group[0].0;
+            for (mut event_batches, clicks) in partitions {
+                // Count each person's records, then scatter into one contiguous event
+                // buffer. Replacing each key with its slot avoids a second hash lookup.
+                let mut slots = AHashMap::<u64, usize>::new();
+                let mut people = Vec::<(u64, usize, Vec<Click>)>::new();
+                for (key, _) in event_batches.iter_mut().flatten() {
+                    let slot = *slots.entry(*key).or_insert_with(|| {
+                        people.push((*key, 0, Vec::new()));
+                        people.len() - 1
+                    });
+                    people[slot].1 += 1;
+                    *key = slot as u64;
+                }
+                for (key, click) in clicks.into_iter().flatten() {
+                    if let Some(&slot) = slots.get(&key) {
+                        people[slot].2.push(click);
+                    }
+                }
+                let mut ends = Vec::with_capacity(people.len());
+                let mut offset = 0;
+                for (_, count, _) in &people {
+                    ends.push(offset);
+                    offset += count;
+                }
+                let mut sorted = vec![
+                    Event {
+                        time: 0,
+                        revenue: 0,
+                        category: 0
+                    };
+                    offset
+                ];
+                for (slot, event) in event_batches.into_iter().flatten() {
+                    let cursor = &mut ends[slot as usize];
+                    sorted[*cursor] = event;
+                    *cursor += 1;
+                }
+                let mut start = 0;
+                for ((user_id, _, mut clicks), end) in people.into_iter().zip(ends) {
                     let user = users.decode(user_id);
-                    while click_groups.next_if(|g| g[0].0 < user_id).is_some() {}
-                    let clicks = click_groups
-                        .next_if(|g| g[0].0 == user_id)
-                        .unwrap_or_default();
+                    clicks.sort_unstable_by(|a, b| {
+                        a.time
+                            .cmp(&b.time)
+                            .then_with(|| click_ids.compare(b.id, a.id))
+                    });
+                    clicks.dedup_by(|a, b| a.id == b.id);
                     let days = summarize(
-                        &mut person_events,
-                        clicks,
+                        &mut sorted[start..end],
+                        &clicks,
                         organic,
                         &mut active,
                         &mut campaign_days,
                     );
+                    start = end;
                     let write_started = profile.then(Instant::now);
                     for (day, daily) in days {
                         let top = daily

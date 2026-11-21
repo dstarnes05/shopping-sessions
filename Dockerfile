@@ -1,8 +1,9 @@
-FROM rust:1.94-bookworm AS build
+FROM rust:1.94.0-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release --locked
+COPY training/ training/
+RUN sh training/build.sh
 
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
