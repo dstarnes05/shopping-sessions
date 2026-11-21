@@ -18,6 +18,13 @@ impl Ids {
     }
 
     pub fn encode(&self, bytes: &[u8]) -> u64 {
+        if let [prefix, suffix @ ..] = bytes {
+            if let Ok(word) = <[u8; 8]>::try_from(suffix) {
+                if *prefix == self.prefix && word[0] < 128 && word[7] != 0 {
+                    return u64::from_be_bytes(word);
+                }
+            }
+        }
         // Right-padding preserves byte order. A trailing NUL needs the dictionary
         // so decoding can distinguish the original suffix from its padding.
         if bytes.first() == Some(&self.prefix)
