@@ -1,0 +1,21 @@
+name: Native x86 benchmark
+on:
+  push:
+    branches: [codex/native-runner-bench]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate common input
+        run: |
+          lscpu
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup override set 1.94.0
+          cargo run --release --locked --manifest-path bench/gen/Cargo.toml -- --seed 42 --events 20000000 --clicks 5000000 --output /tmp/shop-input
+          python -m pip install polars
+      - name: Build and compare variants
+        run: bash bench/run.sh
