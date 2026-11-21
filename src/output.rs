@@ -1,4 +1,10 @@
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parquet::{
     basic::Compression,
@@ -78,6 +84,7 @@ fn write_group(writer: &mut SerializedFileWriter<fs::File>, columns: &[Column<'_
 }
 
 pub struct UserWriter {
+    parquet_time: Duration,
     writer: SerializedFileWriter<fs::File>,
     ids: Vec<ByteArray>,
     days: Vec<i32>,
@@ -93,8 +100,11 @@ impl UserWriter {
         let file = destination
             .join("user_daily")
             .join(format!("part-{partition:03}.parquet"));
+        let started = Instant::now();
+        let writer = writer(&file, USER_SCHEMA)?;
         Ok(Self {
-            writer: writer(&file, USER_SCHEMA)?,
+            parquet_time: started.elapsed(),
+            writer,
             ids: Vec::new(),
             days: Vec::new(),
             sessions: Vec::new(),
@@ -131,6 +141,7 @@ impl UserWriter {
         if self.ids.is_empty() {
             return Ok(());
         }
+        let started = Instant::now();
         write_group(
             &mut self.writer,
             &[
@@ -142,6 +153,7 @@ impl UserWriter {
                 Column::OptionalText(&self.categories, &self.category_levels),
             ],
         )?;
+        self.parquet_time += started.elapsed();
         self.ids.clear();
         self.days.clear();
         self.sessions.clear();
@@ -152,10 +164,11 @@ impl UserWriter {
         Ok(())
     }
 
-    pub fn close(mut self) -> Result<()> {
+    pub fn close(mut self) -> Result<Duration> {
         self.flush()?;
+        let started = Instant::now();
         self.writer.close()?;
-        Ok(())
+        Ok(self.parquet_time + started.elapsed())
     }
 }
 
