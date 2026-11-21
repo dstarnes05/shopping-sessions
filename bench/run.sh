@@ -9,7 +9,7 @@ for v in "${variants[@]}"; do
       count) cp bench/count.rs src/main.rs ;;
       batches|mapped|row|tuned|pgo) cp bench/main.rs src/main.rs ;;
     esac
-    case "$v" in mapped|row|tuned|pgo) cp bench/{Cargo.toml,Cargo.lock} .; cp bench/input.rs src/ ;; esac
+    case "$v" in mapped|row|tuned|pgo) cp bench/mapped.toml Cargo.toml; cp bench/mapped.lock Cargo.lock; cp bench/input.rs src/ ;; esac
     case "$v" in row|tuned|pgo) cp bench/block.rs src/ ;; esac
     case "$v" in tuned|pgo) export RUSTFLAGS='-C target-cpu=cascadelake';; esac
     if [ "$v" = pgo ]; then
